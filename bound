@@ -1,0 +1,92 @@
+from thermodynamics import FluidProperties
+import numpy as np
+
+
+def find_turning_point(fluid_name: str):
+    """
+    Find the 'knee' on the T-s saturation curve where ds/dT = 0.
+    """
+    # Instantiate the class (Fixes the 'self' error)
+    fluid = FluidProperties(fluid_name)
+
+    T_crit, P_crit, T_triple, P_triple = fluid.cache_critical_properties()
+
+    # Scan from Critical Pressure down to Triple Point
+    p_scan = np.linspace(P_crit, P_triple, 500)
+
+    s_prev, t_prev, p_prev = None, None, None
+    turning_point = None
+
+    for p in p_scan:
+        try:
+            t_sat = fluid.get_property_value('T', 'P', p, 'Q', 1)
+            s_sat = fluid.get_property_value('S', 'P', p, 'Q', 1)
+        except:
+            continue
+
+        if s_prev is not None:
+            # For dry fluids, entropy increases as pressure drops from critical
+            # until it hits the 'knee', then it starts decreasing.
+            if s_sat < s_prev:
+                turning_point = {'P': p_prev, 'T': t_prev, 's': s_prev}
+                break
+
+        s_prev, t_prev, p_prev = s_sat, t_sat, p
+
+    if turning_point is None:
+        raise ValueError(f"{fluid_name} appears to be a wet fluid.")
+
+    print(f"\n  Turning Point Found:")
+    print(f"  P = {turning_point['P'] / 1e5:.4f} bar")
+    print(f"  T = {turning_point['T']:.2f} °C")
+    print(f"  s = {turning_point['s']:.4f} J/kgK")
+
+    return turning_point
+
+
+def find_p_high_bounds(fluid_name, p_upper, t_inlet_k, t_cond_out, eta_pump, eta_turb):
+    """
+    Calculates the lower pressure limit where Net Work would be zero.
+    """
+    fluid = FluidProperties(fluid_name)
+
+    # 1. Pump inlet (saturated liquid at condensing temp)
+    p_cond = fluid.get_property_value('P', 'T', t_cond_out, 'Q', 0)
+    state_4 = fluid.get_state('P', p_cond, 'Q', 0)
+
+    # 2. Estimate Pump Work at the highest possible pressure
+    h_5s = fluid.get_property_value('H', 'P', p_upper, 'S', state_4.s)
+    w_pump_max = (h_5s - state_4.h) / eta_pump
+
+    # 3. Find Inlet Enthalpy at the candidate T_inlet
+    h_1 = fluid.get_property_value('H', 'T', t_inlet_k, 'P', p_upper)
+
+    # 4. Set W_net = 0 threshold (W_turbine = W_pump)
+    # (h1 - h2s) * eta_turb = w_pump_max
+    h_2s_threshold = h_1 - (w_pump_max / eta_turb)
+
+    # 5. Determine the pressure corresponding to this expansion limit
+    s_limit = fluid.get_property_value('S', 'P', p_cond, 'H', h_2s_threshold)
+    p_lower = fluid.get_property_value('P', 'T', t_inlet_k, 'S', s_limit)
+
+    return p_lower
+
+
+if __name__ == "__main__":
+    # Input parameters in lowercase
+    fluid_name = "Pentane"
+    t_cond_out = 47 + 273.15
+    eta_p = 0.75
+    eta_t = 0.88
+
+    # Step 1: Find the upper thermodynamic limit (the knee)
+    tp = find_turning_point(fluid_name)
+    p_max = tp['P']
+    t_inlet = tp['T'] + 2  # Applying your 2K superheat logic
+
+    # Step 2: Find the lower mechanical limit (W_net > 0)
+    p_min = find_p_high_bounds(fluid_name, p_max, t_inlet, t_cond_out, eta_p, eta_t)
+
+    print(f"--- Optimization Window for {fluid_name} ---")
+    print(f"Lower Bound (P_min): {p_min / 1e5:.2f} bar")
+    print(f"Upper Bound (P_max): {p_max / 1e5:.2f} bar")
