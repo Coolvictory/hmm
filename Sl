@@ -1,0 +1,541 @@
+"""
+solver.py
+=========
+ORC cycle solver with three-level nested GSS optimisation.
+
+Cycle topology:
+  State 1  Turbine inlet        High P, superheated   T1 FIXED input
+  State 2  Turbine exhaust      Low P,  superheated   varies with P_cond
+  State 3  Recup hot-out        Low P,  superheated   T3 = T_sat(P_cond) + dT_super
+  State 5  Condenser outlet     Low P,  subcooled     T5 = T_sat(P_cond) - dT_sub
+  State 6  Pump outlet          High P, subcooled liquid
+  State 7  Recup cold-out       High P, SUBCOOLED     h7 = h6 + (h2 - h3)
+  (1)      Economiser cold-out  High P, superheated   = State 1
+
+Key physics:
+  T1 is a FIXED input temperature.
+  h1, s1 = f(T1, P_high) -- precomputed once per P_high, no circular dependency.
+
+  State 7 subcooled at P_high:
+    h7 = h6 + Q_recup_hot   where Q_recup_hot = h2 - h3
+    T7 = temperature_from_PH(P_high, h7)
+    Check: T7 < T_sat(P_high)
+
+  Economiser duty adjusts to match T1:
+    Q_econ = mdot_wf * (h1 - h7)   [adjusts with h7]
+    Gas available: Q_gas = mdot_gas * Cp_gas * (T_gas_in - T_gas_out)
+    Feasibility: Q_econ <= Q_gas
+    T_gas_out_actual = T_gas_in - Q_econ / (mdot_gas * Cp_gas)
+    Pinch cold: T_gas_out_actual > T7
+    Pinch hot:  T_gas_in        > T1
+
+  Condenser spread constraint:
+    T3 - T5 = dT_super + dT_sub <= cond_spread_max
+    dT_super >= epsilon,  dT_sub >= epsilon
+    Optimiser chooses (dT_super, dT_sub) freely subject to sum <= cond_spread_max
+
+Three-level nested optimisation:
+  Level 1 (outer):  dT_super over [epsilon, cond_spread_max - epsilon]
+  Level 2 (middle): dT_sub   over [epsilon, cond_spread_max - dT_super]
+  Level 3 (inner):  P_cond   over [P_cond_lo, P_cond_hi]
+
+  For each (dT_super, dT_sub, P_cond):
+    T3 = T_sat(P_cond) + dT_super
+    T5 = T_sat(P_cond) - dT_sub
+    Direct forward solve: 1 -> 2 -> (3,5) -> 6 -> 7
+    No iteration needed (T1 fixed)
+
+Fallback:
+  If no feasible solution at P_high: P_high -= 1 bar, retry.
+"""
+
+import math
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import thermodynamics as td
+import components as comp
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# DATACLASSES
+# =============================================================================
+
+@dataclass
+class CycleConfiguration:
+    """All fixed cycle inputs. Edit main.py only."""
+
+    fluid:           str
+
+    # Turbine inlet -- FIXED temperature and starting pressure
+    T1_fixed:        float      # K   turbine inlet temperature (fixed input)
+    P_high_start:    float      # Pa  turbine inlet pressure starting value
+
+    # Cooling water
+    T_cw_in:         float      # K
+    dT_cw:           float      # K   temperature rise
+
+    # Condenser spread constraint [K]
+    # T3 - T5 = dT_super + dT_sub <= cond_spread_max
+    cond_spread_max: float      # K   (e.g. 5 K)
+
+    # Economiser external hot gas (all given)
+    # Duty adjusts: Q_econ = mdot_wf * (h1 - h7)
+    # Gas available: Q_gas = mdot_gas * Cp_gas * (T_gas_in - T_gas_out)
+    # Feasibility: Q_econ <= Q_gas
+    T_gas_in:  float            # K
+    T_gas_out: float            # K
+    mdot_gas:  float            # kg/s
+    Cp_gas:    float            # J/kgK
+
+    # Component efficiencies
+    eta_turbine: float = 0.85
+    eta_pump:    float = 0.75
+
+    # Working fluid mass flow
+    mdot: float = 1.0
+
+    # Fallback
+    P_high_min: float = 2e5    # Pa
+
+    # GSS tolerances
+    gss_tol_P:     float = 0.1    # Pa  inner  (P_cond)
+    gss_tol_dTsub: float = 0.01   # K   middle (dT_sub)
+    gss_tol_dTsup: float = 0.01   # K   outer  (dT_super)
+
+    # Minimum approach in condenser split [K]
+    dT_min: float = 0.5           # K   dT_super >= dT_min, dT_sub >= dT_min
+
+    def validate(self) -> None:
+        if self.P_high_start <= 0:
+            raise ValueError("P_high_start must be positive")
+        if self.cond_spread_max <= 2 * self.dT_min:
+            raise ValueError(
+                f"cond_spread_max={self.cond_spread_max} K must be > "
+                f"2 * dT_min={2*self.dT_min} K"
+            )
+        if self.T_gas_in <= self.T_gas_out:
+            raise ValueError("T_gas_in must be > T_gas_out")
+        if not 0 < self.eta_turbine <= 1:
+            raise ValueError("eta_turbine must be in (0, 1]")
+        if not 0 < self.eta_pump <= 1:
+            raise ValueError("eta_pump must be in (0, 1]")
+        if self.mdot <= 0:
+            raise ValueError("mdot must be positive")
+        if self.dT_cw <= 0:
+            raise ValueError("dT_cw must be positive")
+
+
+@dataclass
+class StatePoint:
+    label:       str
+    T:           float
+    P:           float
+    h:           float
+    s:           float
+    description: str = ""
+
+    @property
+    def T_C(self) -> float:
+        return self.T - 273.15
+
+    @property
+    def P_bar(self) -> float:
+        return self.P / 1e5
+
+    def to_dict(self) -> Dict:
+        return {
+            "label":       self.label,
+            "T_C":         round(self.T_C, 4),
+            "P_bar":       round(self.P_bar, 5),
+            "h_Jkg":       round(self.h, 3),
+            "s_JkgK":      round(self.s, 4),
+            "description": self.description,
+        }
+
+
+@dataclass
+class CycleResults:
+    states:              Dict[int, StatePoint]
+    P_high:              float
+    P_cond:              float
+    T1:                  float    # K   fixed input (confirmed)
+    h1:                  float    # J/kg  varies with P_high
+    s1:                  float    # J/kgK varies with P_high
+    dT_super_opt:        float    # K   optimised condenser inlet superheat
+    dT_sub_opt:          float    # K   optimised condenser outlet subcool
+    T_sat_cond:          float    # K
+    T7_subcooled:        bool     # True if state 7 is subcooled at P_high
+    Q_econ_required:     float    # W   actual duty needed (h1-h7) * mdot
+    Q_gas_available:     float    # W   maximum gas can supply
+    T_gas_out_actual:    float    # K   actual gas outlet after giving Q_econ
+    w_turbine_specific:  float
+    w_pump_specific:     float
+    w_net_specific:      float
+    q_in_specific:       float    # J/kg  = h1 - h7 (economiser duty per kg)
+    q_cond_specific:     float
+    Q_recup_specific:    float
+    W_turbine:           float
+    W_pump:              float
+    W_net:               float
+    Q_cond_total:        float
+    thermal_efficiency:  float
+    mdot_cw:             float
+    pinch_cold_end:      float    # K  T_gas_out_actual - T7
+    pinch_hot_end:       float    # K  T_gas_in - T1
+    fallback_steps:      int
+    P_high_attempts:     List[float]
+
+    def to_dict(self) -> Dict:
+        d = {k: v for k, v in self.__dict__.items() if k != "states"}
+        d["states"] = {k: v.to_dict() for k, v in self.states.items()}
+        return d
+
+
+# =============================================================================
+# SOLVER
+# =============================================================================
+
+class ORCCycleSolver:
+    """
+    Three-level nested GSS ORC solver.
+
+    solve_at(P_high, P_cond, dT_super, dT_sub, h1, s1):
+        Direct forward solve. No iteration (T1 fixed -> h1, s1 known).
+        Returns CycleResults or None if any constraint violated.
+
+    _inner_gss:   optimise P_cond   for fixed (P_high, dT_super, dT_sub)
+    _middle_gss:  optimise dT_sub   for fixed (P_high, dT_super)
+    _outer_gss:   optimise dT_super for fixed P_high
+    optimise():   runs outer GSS, falls back on P_high if needed
+    """
+
+    def __init__(self, config: CycleConfiguration) -> None:
+        config.validate()
+        self.config   = config
+        self.fluid    = config.fluid
+        self.T_cw_out = config.T_cw_in + config.dT_cw
+
+        # Gas available duty -- fixed from gas side
+        self.Q_gas_available = (config.mdot_gas * config.Cp_gas *
+                                (config.T_gas_in - config.T_gas_out))
+
+        # Inner GSS lower bound: P_cond > P_sat(T_cw_out)
+        # Cooling water must be able to condense the working fluid.
+        self.P_cond_lo = td.sat_pressure(self.T_cw_out, self.fluid)
+
+        logger.info(
+            f"ORCCycleSolver | fluid={self.fluid} | "
+            f"T1_fixed={config.T1_fixed-273.15:.2f}C | "
+            f"T_cw_out={self.T_cw_out-273.15:.2f}C | "
+            f"P_cond_lo={self.P_cond_lo/1e5:.5f} bar"
+        )
+        logger.info(
+            f"Q_gas_available={self.Q_gas_available/1000:.2f} kW | "
+            f"cond_spread_max={config.cond_spread_max} K"
+        )
+
+    # -------------------------------------------------------------------------
+    def _h1_s1(self, P_high: float) -> Tuple[float, float]:
+        """
+        h1, s1 at (T1_fixed, P_high).
+        T1 is fixed -- only h1 and s1 change when P_high changes.
+        Precomputed once per P_high in optimise().
+        """
+        h1 = td.enthalpy(self.config.T1_fixed, P_high, self.fluid)
+        s1 = td.entropy( self.config.T1_fixed, P_high, self.fluid)
+        return h1, s1
+
+    # -------------------------------------------------------------------------
+    def solve_at(
+        self,
+        P_high:   float,
+        P_cond:   float,
+        dT_super: float,
+        dT_sub:   float,
+        h1:       float,
+        s1:       float,
+    ) -> Optional[CycleResults]:
+        """
+        Single direct forward cycle solve.
+        No iteration -- T1 fixed, h1/s1 known, all states flow forward.
+
+        Forward order:
+          1. Check condenser spread and cooling water feasibility
+          2. STATE 2: Turbine  1 -> 2
+          3. STATE 3: Recup hot-out (T3 from dT_super + T_sat)
+          4. STATE 5: Cond outlet  (T5 from dT_sub  + T_sat)
+          5. STATE 6: Pump         5 -> 6
+          6. STATE 7: Recup cold-out  h7 = h6 + Q_recup_hot
+             Check T7 < T_sat(P_high)  [subcooled liquid]
+          7. Economiser: Q_econ = mdot*(h1-h7), check <= Q_gas_available
+          8. Pinch checks, energy balance
+        """
+        cfg   = self.config
+        fluid = self.fluid
+        T1    = cfg.T1_fixed
+
+        T_sat_cond = td.sat_temperature(P_cond, fluid)
+        T_sat_high = td.sat_temperature(P_high, fluid)
+
+        # T1 must be superheated at P_high
+        if T1 <= T_sat_high:
+            logger.debug(f"  T1={T1-273.15:.2f}C not superheated at P_high")
+            return None
+
+        # Condenser temperatures from T_sat and split
+        T3 = T_sat_cond + dT_super
+        T5 = T_sat_cond - dT_sub
+
+        # T5 must be above cooling water outlet
+        if T5 <= self.T_cw_out:
+            logger.debug(
+                f"  T5={T5-273.15:.2f}C <= T_cw_out={self.T_cw_out-273.15:.2f}C"
+            )
+            return None
+
+        # ------------------------------------------------------------------
+        # STATE 2  Turbine exhaust  1 -> 2
+        # h1, s1 precomputed and fixed for this P_high.
+        # h2, T2 vary with P_cond.
+        # ------------------------------------------------------------------
+        turb = comp.turbine(h1, s1, P_cond, cfg.eta_turbine, fluid)
+        T2   = turb["T"]
+        h2   = turb["h"]
+        h2s  = turb["h_isen"]
+
+        if T2 <= T_sat_cond:
+            logger.debug(f"  T2={T2-273.15:.2f}C two-phase at P_cond")
+            return None
+        if T2 <= T3:
+            logger.debug(f"  T2={T2-273.15:.2f}C <= T3={T3-273.15:.2f}C -- recup cross")
+            return None
+
+        # ------------------------------------------------------------------
+        # STATE 3  Recup hot-out / Cond inlet
+        # ------------------------------------------------------------------
+        h3 = td.enthalpy(T3, P_cond, fluid)
+
+        # ------------------------------------------------------------------
+        # STATE 5  Cond outlet  (T5 fixed by dT_sub)
+        # ------------------------------------------------------------------
+        h5 = td.enthalpy(T5, P_cond, fluid)
+        s5 = td.entropy( T5, P_cond, fluid)
+
+        # ------------------------------------------------------------------
+        # STATE 6  Pump outlet  5 -> 6
+        # ------------------------------------------------------------------
+        pump_out = comp.pump(h5, s5, P_high, cfg.eta_pump, fluid)
+        h6 = pump_out["h"]
+        T6 = pump_out["T"]
+
+        # ------------------------------------------------------------------
+        # STATE 7  Recup cold-out
+        # Q_recup = h2 - h3  (hot side duty)
+        # h7 = h6 + Q_recup  (cold side receives same duty)
+        # T7 = temperature_from_PH(P_high, h7)
+        # MUST be subcooled liquid: T7 < T_sat(P_high)
+        # ------------------------------------------------------------------
+        Q_recup = h2 - h3
+
+        if Q_recup <= 0:
+            logger.debug(f"  Q_recup={Q_recup:.1f} J/kg <= 0")
+            return None
+
+        h7 = h6 + Q_recup
+        T7 = td.temperature_from_PH(P_high, h7, fluid)
+
+        if T7 >= T_sat_high:
+            logger.debug(
+                f"  T7={T7-273.15:.2f}C >= T_sat(P_high)={T_sat_high-273.15:.2f}C "
+                f"-- state 7 not subcooled liquid"
+            )
+            return None
+
+        # ------------------------------------------------------------------
+        # ECONOMISER  state 7 -> state 1
+        # Q_econ = mdot * (h1 - h7)  -- adjusts with h7
+        # Must not exceed gas available duty.
+        # T_gas_out_actual = T_gas_in - Q_econ / (mdot_gas * Cp_gas)
+        # Pinch cold: T_gas_out_actual > T7
+        # Pinch hot:  T_gas_in > T1
+        # ------------------------------------------------------------------
+        q_econ        = h1 - h7                           # J/kg
+        Q_econ_required = cfg.mdot * q_econ               # W
+
+        if q_econ <= 0:
+            logger.debug(f"  q_econ={q_econ:.1f} J/kg <= 0 -- h7 >= h1")
+            return None
+
+        if Q_econ_required > self.Q_gas_available:
+            logger.debug(
+                f"  Q_econ_required={Q_econ_required/1000:.2f} kW > "
+                f"Q_gas_available={self.Q_gas_available/1000:.2f} kW"
+            )
+            return None
+
+        T_gas_out_actual = cfg.T_gas_in - Q_econ_required / (cfg.mdot_gas * cfg.Cp_gas)
+
+        pinch_cold = T_gas_out_actual - T7
+        pinch_hot  = cfg.T_gas_in    - T1
+
+        if pinch_cold <= 0:
+            logger.debug(
+                f"  Cold pinch={pinch_cold:.2f} K "
+                f"(T_gas_out_actual={T_gas_out_actual-273.15:.2f}C "
+                f"T7={T7-273.15:.2f}C)"
+            )
+            return None
+        if pinch_hot <= 0:
+            logger.debug(f"  Hot pinch={pinch_hot:.2f} K (T_gas_in={cfg.T_gas_in-273.15:.2f}C T1={T1-273.15:.2f}C)")
+            return None
+
+        # ------------------------------------------------------------------
+        # ENERGY BALANCE
+        # ------------------------------------------------------------------
+        w_turbine = turb["w"]
+        w_pump    = pump_out["w"]
+        w_net     = w_turbine - w_pump
+        q_in      = q_econ           # J/kg  economiser duty = external heat input
+        q_cond    = h3 - h5
+
+        if w_net <= 0 or q_cond <= 0:
+            logger.debug(f"  w_net={w_net:.1f} q_cond={q_cond:.1f} -- non-positive")
+            return None
+
+        eta_cycle = w_net / q_in
+        mdot_cw   = (cfg.mdot * q_cond) / (4186.0 * cfg.dT_cw)
+
+        logger.debug(
+            f"  OK | P_cond={P_cond/1e5:.4f} bar "
+            f"dT_sup={dT_super:.3f}K dT_sub={dT_sub:.3f}K | "
+            f"T7={T7-273.15:.2f}C T1={T1-273.15:.2f}C | "
+            f"eta={eta_cycle*100:.3f}%"
+        )
+
+        # Build state points
+        s2 = td.entropy_from_PH(P_cond, h2, fluid)
+        s3 = td.entropy_from_PH(P_cond, h3, fluid)
+        s6 = td.entropy_from_PH(P_high, h6, fluid)
+        s7 = td.entropy_from_PH(P_high, h7, fluid)
+
+        states = {
+            1: StatePoint("1", T1, P_high, h1, s1,
+                          "Turbine inlet [T1 fixed input]"),
+            2: StatePoint("2", T2, P_cond, h2, s2,
+                          "Turbine exhaust / Recup hot-in"),
+            3: StatePoint("3", T3, P_cond, h3, s3,
+                          f"Recup hot-out / Cond inlet [T_sat+{dT_super:.3f}K superheat]"),
+            5: StatePoint("5", T5, P_cond, h5, s5,
+                          f"Cond outlet / Pump inlet [T_sat-{dT_sub:.3f}K subcool]"),
+            6: StatePoint("6", T6, P_high, h6, s6,
+                          "Pump outlet / Recup cold-in [subcooled liquid]"),
+            7: StatePoint("7", T7, P_high, h7, s7,
+                          "Recup cold-out / Econ cold-in [SUBCOOLED LIQUID at P_high]"),
+        }
+
+        return CycleResults(
+            states              = states,
+            P_high              = P_high,
+            P_cond              = P_cond,
+            T1                  = T1,
+            h1                  = h1,
+            s1                  = s1,
+            dT_super_opt        = dT_super,
+            dT_sub_opt          = dT_sub,
+            T_sat_cond          = T_sat_cond,
+            T7_subcooled        = True,
+            Q_econ_required     = Q_econ_required,
+            Q_gas_available     = self.Q_gas_available,
+            T_gas_out_actual    = T_gas_out_actual,
+            w_turbine_specific  = w_turbine,
+            w_pump_specific     = w_pump,
+            w_net_specific      = w_net,
+            q_in_specific       = q_in,
+            q_cond_specific     = q_cond,
+            Q_recup_specific    = Q_recup,
+            W_turbine           = cfg.mdot * w_turbine,
+            W_pump              = cfg.mdot * w_pump,
+            W_net               = cfg.mdot * w_net,
+            Q_cond_total        = cfg.mdot * q_cond,
+            thermal_efficiency  = eta_cycle,
+            mdot_cw             = mdot_cw,
+            pinch_cold_end      = pinch_cold,
+            pinch_hot_end       = pinch_hot,
+            fallback_steps      = 0,
+            P_high_attempts     = [],
+        )
+
+    # -------------------------------------------------------------------------
+    def _inner_gss(
+        self,
+        P_high:   float,
+        dT_super: float,
+        dT_sub:   float,
+        h1:       float,
+        s1:       float,
+        visited:  Dict,
+    ) -> Optional[CycleResults]:
+        """Level 3: optimise P_cond for fixed (P_high, dT_super, dT_sub)."""
+        a   = self.P_cond_lo
+        b   = 0.8 * P_high      # cap at 80% of P_high
+
+        if a >= b:
+            return None
+
+        phi = (math.sqrt(5) - 1) / 2
+        tol = self.config.gss_tol_P
+
+        def obj(P):
+            res = self.solve_at(P_high, P, dT_super, dT_sub, h1, s1)
+            if res is not None:
+                visited[(dT_super, dT_sub, P)] = res
+                return -res.thermal_efficiency
+            return float("inf")
+
+        c = b - phi * (b - a)
+        d = a + phi * (b - a)
+        fc, fd = obj(c), obj(d)
+
+        while (b - a) > tol:
+            if fc < fd:
+                b, d, fd = d, c, fc
+                c  = b - phi * (b - a)
+                fc = obj(c)
+            else:
+                a, c, fc = c, d, fd
+                d  = a + phi * (b - a)
+                fd = obj(d)
+
+        P_opt = (a + b) / 2.0
+        best  = self.solve_at(P_high, P_opt, dT_super, dT_sub, h1, s1)
+        if best is not None:
+            visited[(dT_super, dT_sub, P_opt)] = best
+        return best
+
+    # -------------------------------------------------------------------------
+    def _middle_gss(
+        self,
+        P_high:   float,
+        dT_super: float,
+        h1:       float,
+        s1:       float,
+        visited:  Dict,
+    ) -> Optional[CycleResults]:
+        """
+        Level 2: optimise dT_sub for fixed (P_high, dT_super).
+        dT_sub range: [dT_min, cond_spread_max - dT_super]
+        """
+        cfg  = self.config
+        a    = cfg.dT_min
+        b    = cfg.cond_spread_max - dT_super
+
+        if a >= b:
+            logger.debug(f"  Middle band collapsed for dT_super={dT_super:.3f}K")
+            return None
+
+        phi = (math.sqrt(5) - 1) / 2
+        tol = self.confi
